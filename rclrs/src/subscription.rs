@@ -83,7 +83,7 @@ where
     ///
     /// Holding onto this sender will keep the subscription task alive. Once
     /// this sender is dropped, the subscription task will end itself.
-    callback: Arc<Mutex<AnySubscriptionCallback<T, Scope::Payload>>>,
+    callback: SharedCallback<T, Scope::Payload>,
     /// Holding onto this keeps the waiter for this subscription alive in the
     /// wait set of the executor.
     #[allow(unused)]
@@ -132,7 +132,7 @@ where
         commands: &Arc<WorkerCommands>,
     ) -> Result<Arc<Self>, RclrsError> {
         let SubscriptionOptions { topic, qos } = options.into();
-        let callback = Arc::new(Mutex::new(callback));
+        let callback = Arc::new(Mutex::new(Some(callback)));
 
         // SAFETY: Getting a zero-initialized value is always safe.
         let mut rcl_subscription = unsafe { rcl_get_zero_initialized_subscription() };
@@ -201,7 +201,7 @@ impl<T: Message> SubscriptionState<T, Node> {
     /// If the `Scope` is [`Worker<Payload>`] then use [`Self::set_worker_callback`] instead.
     pub fn set_callback<Args>(&self, callback: impl IntoNodeSubscriptionCallback<T, Args>) {
         let callback = callback.into_node_subscription_callback();
-        *self.callback.lock().unwrap() = callback;
+        *self.callback.lock().unwrap() = Some(callback);
     }
 
     /// Set the callback of this subscription, replacing the callback that was
@@ -213,7 +213,7 @@ impl<T: Message> SubscriptionState<T, Node> {
     /// If the `Scope` is [`Worker<Payload>`] then use [`Self::set_worker_callback`] instead.
     pub fn set_async_callback<Args>(&self, callback: impl IntoAsyncSubscriptionCallback<T, Args>) {
         let callback = callback.into_async_subscription_callback();
-        *self.callback.lock().unwrap() = callback;
+        *self.callback.lock().unwrap() = Some(callback);
     }
 }
 
@@ -229,7 +229,7 @@ impl<T: Message, Payload: 'static + Send + Sync> SubscriptionState<T, Worker<Pay
         callback: impl IntoWorkerSubscriptionCallback<T, Payload, Args>,
     ) {
         let callback = callback.into_worker_subscription_callback();
-        *self.callback.lock().unwrap() = callback;
+        *self.callback.lock().unwrap() = Some(callback);
     }
 }
 
@@ -265,9 +265,11 @@ impl<'a, T: IntoPrimitiveOptions<'a>> From<T> for SubscriptionOptions<'a> {
     }
 }
 
+type SharedCallback<T, Payload> = Arc<Mutex<Option<AnySubscriptionCallback<T, Payload>>>>;
+
 struct SubscriptionExecutable<T: Message, Payload> {
     handle: Arc<SubscriptionHandle>,
-    callback: Arc<Mutex<AnySubscriptionCallback<T, Payload>>>,
+    callback: SharedCallback<T, Payload>,
     commands: Arc<WorkerCommands>,
 }
 
@@ -281,10 +283,11 @@ where
         payload: &mut dyn Any,
     ) -> Result<(), RclrsError> {
         ready.for_basic()?;
-        self.callback
-            .lock()
-            .unwrap()
-            .execute(&self.handle, payload, &self.commands)
+        // Run the callback outside the lock so it can replace itself through set_callback.
+        let mut callback = self.callback.lock().unwrap().take().unwrap();
+        let result = callback.execute(&self.handle, payload, &self.commands);
+        self.callback.lock().unwrap().get_or_insert(callback);
+        result
     }
 
     fn kind(&self) -> RclPrimitiveKind {
@@ -714,5 +717,237 @@ mod tests {
         let qos = subscription.qos();
         assert_eq!(expected_qos.reliability, qos.reliability);
         assert_eq!(qos.reliability, QoSReliabilityPolicy::BestEffort);
+    }
+
+    fn spin_until(executor: &mut crate::Executor, mut done: impl FnMut() -> bool) {
+        let start_time = std::time::Instant::now();
+        while !done() {
+            assert!(executor
+                .spin(
+                    crate::SpinOptions::spin_once().timeout(std::time::Duration::from_millis(100))
+                )
+                .iter()
+                .all(|err| matches!(
+                    err,
+                    RclrsError::RclError {
+                        code: crate::RclReturnCode::Timeout,
+                        ..
+                    }
+                )));
+            assert!(start_time.elapsed() < std::time::Duration::from_secs(10));
+        }
+    }
+
+    #[test]
+    fn test_sync_callback_mutates_captured_state() {
+        use crate::*;
+        use std::cell::Cell;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(&format!("test_sync_callback_mutable_{}", line!()))
+            .unwrap();
+        let qos = QoSProfile::default().keep_all().reliable();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        // Cell makes the closure !Sync, which only an FnMut + Send bound accepts.
+        let count = Cell::new(0);
+        let mut last = 0;
+        let _subscription = node
+            .create_subscription(
+                "test_sync_callback_mutable".qos(qos),
+                move |msg: msg::BasicTypes| {
+                    count.set(count.get() + 1);
+                    assert!(msg.int32_value > last);
+                    last = msg.int32_value;
+                    sink.lock().unwrap().push((count.get(), last));
+                },
+            )
+            .unwrap();
+        let publisher = node
+            .create_publisher::<msg::BasicTypes>("test_sync_callback_mutable".qos(qos))
+            .unwrap();
+        for value in 1..=3 {
+            publisher
+                .publish(msg::BasicTypes {
+                    int32_value: value,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        spin_until(&mut executor, || received.lock().unwrap().len() == 3);
+        assert_eq!(*received.lock().unwrap(), [(1, 1), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn test_sync_callback_keep_last_with_slow_callback() {
+        use crate::*;
+        use std::time::Duration;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(
+                format!("test_sync_callback_keep_last_{}", line!()).start_parameter_services(false),
+            )
+            .unwrap();
+        let qos = QoSProfile::default().keep_last(1).reliable();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        let (done, finished) = futures::channel::oneshot::channel();
+        let mut done = Some(done);
+        let _subscription = node
+            .create_subscription(
+                "test_sync_callback_keep_last".qos(qos),
+                move |msg: msg::BasicTypes| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    sink.lock().unwrap().push(msg.int32_value);
+                    if msg.int32_value == 49 {
+                        done.take().unwrap().send(()).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        let publisher = node
+            .create_publisher::<msg::BasicTypes>("test_sync_callback_keep_last".qos(qos))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let publishing = std::thread::spawn(move || {
+            for value in 0..50 {
+                publisher
+                    .publish(msg::BasicTypes {
+                        int32_value: value,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        // Spin continuously: between spin_once calls no message is taken at all.
+        let errors = executor.spin(
+            SpinOptions::default()
+                .until_promise_resolved(finished)
+                .timeout(Duration::from_secs(10)),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        publishing.join().unwrap();
+        let received = received.lock().unwrap();
+        assert!(received.len() < 25, "{received:?}");
+        assert!(received.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn test_sync_callback_replaces_itself() {
+        use crate::*;
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(&format!("test_sync_callback_replaces_itself_{}", line!()))
+            .unwrap();
+        let qos = QoSProfile::default().keep_all().reliable();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let this = Arc::new(Mutex::new(None::<Subscription<msg::BasicTypes>>));
+        let (sink, this_in_callback) = (Arc::clone(&received), Arc::clone(&this));
+        let subscription = node
+            .create_subscription(
+                "test_sync_callback_replaces_itself".qos(qos),
+                move |msg: msg::BasicTypes| {
+                    sink.lock().unwrap().push(msg.int32_value);
+                    let sink = Arc::clone(&sink);
+                    let this = this_in_callback.lock().unwrap().take().unwrap();
+                    this.set_callback(move |msg: msg::BasicTypes| {
+                        sink.lock().unwrap().push(-msg.int32_value);
+                    });
+                },
+            )
+            .unwrap();
+        *this.lock().unwrap() = Some(Arc::clone(&subscription));
+        let publisher = node
+            .create_publisher::<msg::BasicTypes>("test_sync_callback_replaces_itself".qos(qos))
+            .unwrap();
+        for value in 1..=2 {
+            publisher
+                .publish(msg::BasicTypes {
+                    int32_value: value,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        spin_until(&mut executor, || received.lock().unwrap().len() == 2);
+        assert_eq!(*received.lock().unwrap(), [1, -2]);
+    }
+
+    #[test]
+    fn test_async_and_replaced_callbacks() {
+        use crate::*;
+        use futures::{channel::mpsc, StreamExt};
+
+        let mut executor = Context::default().create_basic_executor();
+        let node = executor
+            .create_node(&format!("test_async_and_replaced_callbacks_{}", line!()))
+            .unwrap();
+        let qos = QoSProfile::default().keep_all().reliable();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (sender, mut receiver) = mpsc::unbounded::<i32>();
+        let sink = Arc::clone(&received);
+        let subscription = node
+            .create_async_subscription(
+                "test_async_and_replaced_callbacks".qos(qos),
+                move |msg: msg::BasicTypes| {
+                    let sender = sender.clone();
+                    async move {
+                        sender.unbounded_send(msg.int32_value).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        let forward = Arc::clone(&sink);
+        let _forwarding = executor.commands().run(async move {
+            while let Some(value) = receiver.next().await {
+                forward.lock().unwrap().push(-value);
+            }
+        });
+        let publisher = node
+            .create_publisher::<msg::BasicTypes>("test_async_and_replaced_callbacks".qos(qos))
+            .unwrap();
+        let publish = |value| {
+            publisher
+                .publish(msg::BasicTypes {
+                    int32_value: value,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+
+        publish(1);
+        spin_until(&mut executor, || received.lock().unwrap().len() == 1);
+
+        // A synchronous callback may create entities and replace the callback
+        // of another subscription while it runs.
+        let other = Arc::new(Mutex::new(None::<Subscription<msg::Empty>>));
+        let other_in_callback = Arc::clone(&other);
+        let node_in_callback = Arc::clone(&node);
+        let sync_sink = Arc::clone(&sink);
+        subscription.set_callback(move |msg: msg::BasicTypes, _: MessageInfo| {
+            let other = node_in_callback
+                .create_subscription("test_async_and_replaced_other", |_: msg::Empty| {})
+                .unwrap();
+            other.set_callback(|_: msg::Empty| {});
+            *other_in_callback.lock().unwrap() = Some(other);
+            sync_sink.lock().unwrap().push(msg.int32_value);
+        });
+        publish(2);
+        spin_until(&mut executor, || received.lock().unwrap().len() == 2);
+        assert!(other.lock().unwrap().is_some());
+
+        let async_sink = Arc::clone(&sink);
+        subscription.set_async_callback(move |msg: msg::BasicTypes| {
+            let async_sink = Arc::clone(&async_sink);
+            async move {
+                async_sink.lock().unwrap().push(msg.int32_value * 10);
+            }
+        });
+        publish(3);
+        spin_until(&mut executor, || received.lock().unwrap().len() == 3);
+        assert_eq!(*received.lock().unwrap(), [-1, 2, 30]);
     }
 }

@@ -799,37 +799,34 @@ impl NodeState {
     /// # Subscription Callbacks
     ///
     /// Subscription callbacks support six signatures:
-    /// - [`Fn`] ( `Message` )
-    /// - [`Fn`] ( `Message`, [`MessageInfo`][1] )
-    /// - [`Fn`] ( [`Box`]<`Message`> )
-    /// - [`Fn`] ( [`Box`]<`Message`>, [`MessageInfo`][1] )
-    /// - [`Fn`] ( [`ReadOnlyLoanedMessage`][2]<`Message`> )
-    /// - [`Fn`] ( [`ReadOnlyLoanedMessage`][2]<`Message`>, [`MessageInfo`][1] )
+    /// - [`FnMut`] ( `Message` )
+    /// - [`FnMut`] ( `Message`, [`MessageInfo`][1] )
+    /// - [`FnMut`] ( [`Box`]<`Message`> )
+    /// - [`FnMut`] ( [`Box`]<`Message`>, [`MessageInfo`][1] )
+    /// - [`FnMut`] ( [`ReadOnlyLoanedMessage`][2]<`Message`> )
+    /// - [`FnMut`] ( [`ReadOnlyLoanedMessage`][2]<`Message`>, [`MessageInfo`][1] )
     ///
     /// [1]: crate::MessageInfo
     /// [2]: crate::ReadOnlyLoanedMessage
     ///
-    /// All function signatures use [`Fn`] since the callback may be run
-    /// multiple times simultaneously across different threads depending on the
-    /// executor runtime that is being used. Because of this, any internal state
-    /// captured into the callback that needs to be mutated will need to be
-    /// wrapped in [`Mutex`] to ensure it is synchronized across multiple
-    /// simultaneous runs of the callback. For example:
+    /// The callback runs inline while the executor processes the wait set,
+    /// one message at a time, so it can mutate the state it captures directly.
+    /// A message is only taken when the callback is about to run, so the
+    /// history depth of the QoS applies when the callback is slower than the
+    /// publisher. Use [`Self::create_async_subscription`] for work that needs
+    /// to `.await`. For example:
     ///
     /// ```
     /// # use rclrs::*;
     /// # use ros_env::example_interfaces;
     /// # let executor = Context::default().create_basic_executor();
     /// # let node = executor.create_node("my_node").unwrap();
-    /// use std::sync::Mutex;
-    ///
-    /// let num_messages = Mutex::new(0usize);
+    /// let mut num_messages = 0usize;
     /// let subscription = node.create_subscription(
     ///     "topic",
     ///     move |msg: example_interfaces::msg::String| {
-    ///         let mut num = num_messages.lock().unwrap();
-    ///         *num += 1;
-    ///         println!("#{} | I heard: '{}'", *num, msg.data);
+    ///         num_messages += 1;
+    ///         println!("#{} | I heard: '{}'", num_messages, msg.data);
     ///     },
     /// )?;
     /// # Ok::<(), RclrsError>(())
