@@ -24,6 +24,9 @@ fn get_ros_distro() -> String {
 }
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_RCL_EXECUTOR").is_some() {
+        println!("cargo:rustc-link-lib=dylib=rcl_executor");
+    }
     println!(
         "cargo:rustc-check-cfg=cfg(ros_distro, values(\"{}\"))",
         KNOWN_DISTROS.join("\", \"")

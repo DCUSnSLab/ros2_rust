@@ -245,7 +245,7 @@ impl WaitableCount {
         }
     }
 
-    fn add_single(&mut self, primitive: &dyn RclPrimitive) {
+    pub(super) fn add_single(&mut self, primitive: &dyn RclPrimitive) {
         match primitive.handle() {
             RclPrimitiveHandle::Subscription(_) => self.subscriptions += 1,
             RclPrimitiveHandle::GuardCondition(_) => self.guard_conditions += 1,

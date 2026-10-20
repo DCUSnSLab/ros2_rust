@@ -72,6 +72,7 @@ ament_rs = "0.3"
 
 [features]
 default = []
+rcl_executor = []
 serde = ["dep:serde", "dep:serde-big-array", "rosidl_runtime_rs/serde", "ros-env/serde"]
 # This feature is solely for the purpose of being able to generate documetation without a ROS installation
 # The only intended usage of this feature is for docs.rs builders to work, and is not intended to be used by end users

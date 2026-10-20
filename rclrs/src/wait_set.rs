@@ -19,6 +19,11 @@ pub use waitable::*;
 mod wait_set_runner;
 pub use wait_set_runner::*;
 
+#[cfg(feature = "rcl_executor")]
+mod rcl_executor;
+#[cfg(feature = "rcl_executor")]
+pub use rcl_executor::*;
+
 /// A struct for waiting on subscriptions and other waitable entities to become ready.
 pub struct WaitSet {
     primitives: HashMap<RclPrimitiveKind, Vec<Waitable>>,
