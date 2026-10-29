@@ -1,4 +1,4 @@
-use ament_rs::search_paths::get_search_paths;
+use ament_rs::{search_paths::get_search_paths, AMENT_PREFIX_PATH_ENV_VAR};
 use std::{env, path::PathBuf};
 
 const ROS_DISTRO: &str = "ROS_DISTRO";
@@ -33,6 +33,8 @@ fn main() {
     );
     println!("cargo:rustc-cfg=ros_distro=\"{}\"", get_ros_distro());
     println!("cargo:rerun-if-env-changed={ROS_DISTRO}");
+    // The link search paths below come from it.
+    println!("cargo:rerun-if-env-changed={AMENT_PREFIX_PATH_ENV_VAR}");
 
     let ament_prefix_paths = get_search_paths().unwrap_or_default();
 
